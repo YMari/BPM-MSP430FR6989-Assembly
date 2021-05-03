@@ -1,0 +1,1430 @@
+#include "msp430.h"                     ; #define controlled include file
+
+        NAME    main                    ; module name
+
+        PUBLIC  main                    ; make the main label vissible
+                                        ; outside this module
+        ORG     0FFE8h                  ; vector for TIMER_A0
+        DC16    TIMER_A0_ISR            ; set vector for 'TIMER_A0_ISR' routine
+
+        ORG     0FFDEh
+        DC16    TIMER_A1_ISR
+        
+        ORG     0FFDAh                  ; vector for PORT1
+        DC16    PORT1_ISR               ; set vector for 'PORT1_ISR' routine
+        
+        ORG     0FFFEh                  ; vector for RESET
+        DC16    init                    ; set reset vector to 'init' label
+
+        ORG     01C00h                  ; Ram
+
+;variables and pointers
+         
+state           db      0                       ;current State
+readingPosition db 0
+displayposition db 0
+numberPointer   db 0 ;number pointer for the NumberHighBytes and NumberLowebytes
+curDigit        db 0
+
+BatteryBarPointer       db 0      
+BatterymemoryPointer    db 0  
+
+heart           db 0
+BpmCounter      db 0
+
+ticks           db 0
+SecondsCounter  db 0
+PeriodCounter   db 0
+                Align 1
+BPMResult       dw 0
+
+num1            dw 0
+num2            dw 0
+num3            dw 0
+
+
+;writing in Memory
+///////////////////////////////////////////////////////////////////////////////////////////
+               ORG     01980h           ;FRAM
+reading1 dw   0  
+reading2 dw   0   
+reading3 dw   0  
+; High Bytes and Low bytes for Numbers
+;                      0        1          2           3          4           5         6          7           8         9
+numberHighBytes  db  11111100B, 01100000B, 11011011B, 11110001B, 01100111B, 10110111B, 10111111B, 11100000B, 11111111B, 11110111B 
+numberLowBytes   db  00101000B, 0, 0, 0, 0, 0, 0, 0, 0, 0
+;------------------------------ALPHABET------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+;                       A       B       C       D       E       F       G       H       I       J       K       L       M       N       O       P       Q           R       S       T       U       V       W       X       Y       Z
+letHigh         db     0xEF,  0xF1,   0x9C,   0xF0,   0x9F,   0x8F,   0xBD,   0x6F,   0x90,   0x70,   0x0E,   0x1C,   0xEC,   0x6C,   0xFC,   0xCF,    0xFC,      0xC1,   0xB7,   0x80,   0x7C,   0x7C,   0x7C,   0x00,   0x00,   0x90
+letLow          db     0   ,  0x50,   0,      0x50,   0,      0,      0,      0,      0x50,   0,      0x22,      0,   0x40,   0x82,   0,      0,       0x82,      0x52,   0,      0x50,   0,      0,      0x10,   0xAA,   0xB0,   0x28
+;--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+; Position map of LCD to memory addresses
+;                        0       1       2       3       4       5
+                  Align 1
+positionHighBytes dw  0x0A29, 0x0A25, 0x0A23, 0x0A32, 0x0A2E, 0x0A27
+positionLowBytes  dw  0x0A2A, 0x0A26, 0x0A24, 0x0A33, 0x0A2F, 0x0A28
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+        RSEG    CSTACK                  ; pre-declaration of segment
+        RSEG    CODE                    ; place program in 'CODE' segment
+
+init:   MOV     #SFE(CSTACK), SP        ; set up stack
+        call    #SetupPins
+        call    #UnlockGPIO
+        call    #SetupLCD
+        call    #setupTimerA0
+        call    #setupTimerA1
+        call    #clearDisplay
+        call    #initState
+
+main:   NOP                             ; main program
+        MOV.W   #WDTPW+WDTHOLD,&WDTCTL  ; Stop watchdog timer
+
+        bic.b   #0xff, &P1IFG           ; To erase a flag raised before
+               	                        ; activating the GIE. This help to
+                                        ; avoid responding to a push on button
+                                        ; previous to program start.
+
+	nop				; required befor enabling interrupts
+
+        bis     #GIE+LPM0, SR           ; Enable interrupts and enter Low Power mode 0
+                                        ; that doesn't disable timers
+        nop                             ; Required after enabling interrupts
+
+        JMP $                           ; jump to current location '$'
+        NOP                             ; (endless loop)
+
+;Objetivo: Habilitar GPIO.
+;Precondiciones: GPIO está bloqueado.
+;Postcondiciones: GPIO está desbloqueado.
+;Autor: José Navarro Figueroa, Kevin Lugo
+;Fecha: 2/11/2021 - 4/25/2021
+
+UnlockGPIO:
+        bic.w   #LOCKLPM5,&PM5CTL0      ; Disable the GPIO power-on default
+                                        ; previously configured port settings
+        MOV.W   #2, &LCDCMEMCTL
+        
+        ret
+        
+;Objetivo: Preparar el LCD para obtener valores.
+;Precondiciones: El LCD esta apagado.
+;Postcondiciones: El LCD esta encendido y listo para obtener valores.
+;Autor: Kevin Lugo
+;Fecha: 3/12/2021 - 4/25/2021
+SetupLCD:
+        mov.w   #0xffff, &LCDCPCTL0
+        mov.w   #0xfc3f, &LCDCPCTL1
+        mov.w   #0x0fff, &LCDCPCTL2
+        
+        mov     #0x041e, &LCDCCTL0
+        mov     #0x0208, &LCDCVCTL
+        mov     #0x8000, &LCDCCPCTL
+        
+        bis     #1, &LCDCCTL0    ;Turn LCD ON
+        ret
+
+;Objetivo: Preparar los botones para ser utilizados como input.
+;Precondiciones: Los botones no están en uso.
+;Postcondiciones: Los botones están listos para ser utilizados como input.
+;Autor: José Navarro Figueroa
+;Fecha: 2/11/2021 - 4/25/2021
+
+SetupPins:
+        bic.b   #0xFF,&P1SEL0           ; Set PxSel0 and PxSel1 to digital I/O
+        bic.b   #0xFF,&P1SEL1           ; Digital I/O is the default
+        bic.b   #0xFF,&P9SEL0
+        bic.b   #0xFF,&P9SEL1
+
+        mov.b   #11111001B,&P1DIR       ; Set P1.1 and P1.2 for input and all
+                                        ; other P1 pins for output
+
+        bic.b #BIT0, P1OUT              ;turn Off red light 
+        mov.b   #00000110B,&P1REN       ; P1.1 Resistor enabled as pullup
+        bis.b   #00000110B,&P1OUT       ; resistor because pushing button
+                                        ; connects it to ground
+        bis.b   #00000110B, &P1IE       ; Enable interrupt at P1.1 and P1.2
+        bis.b   #00000110B, &P1IES      ; Set interrupt on high-to-low 
+                                        ; transition of P1.1
+        ret
+
+;Objetivo: Iniciar el timer.
+;Precondiciones: Que haya un timer inicializado
+;Postcondiciones: El timer se activa para el funcionamiento del dispositivo.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+startTimerA0:
+        mov     #CCIE, &TA0CCTL0
+        ret
+
+;Objetivo: Detener el timer.
+;Precondiciones: Que haya un timer corriendo
+;Postcondiciones: El timer se desactiva.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+stopTimerA0:
+        bic     #CCIE, &TA0CCTL0        ; Stop Timer
+        ret
+
+;Objetivo: Inicializar y configurar las especificaciones del timer principal del BPM
+;Precondiciones: 
+;Postcondiciones: El timer esta configurado y listo para utilizarse.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+setupTimerA0:     
+        mov     #TASSEL_2+MC_1+ID_3, &TA0CTL  ;Set timer according to next table
+	nop
+        ; Uses SMCLK and up mode
+        ; TASSELx        MCx (mode control)                IDx (input divider)
+        ; 00 -> TACLK    00 -> Stop                        00 -> /1
+        ; 01 -> ACLK     01 -> Up mode (up to TACCR0)      01 -> /2
+        ; 10 -> SMCLK    10 -> Continuous (up to 0FFFFh)   02 -> /4
+        ; 11 -> INCLK    11 -> Up/down (top on TACCR0)     03 -> /8
+
+        ; period = cycles * divider / SMLCK
+        ; Assuming SMLCK = 1 MHz, divider = 8 and period = 0.5 seg
+        ; cycles = 62500.  With period = 0.5 LED turn on every 1 second
+        mov     #62500, &TA0CCR0        ; Set the timer capture compare register 0
+
+        ret
+
+;Objetivo: Iniciar el timer.
+;Precondiciones: Que haya un timer inicializado
+;Postcondiciones: El timer se activa para el funcionamiento del dispositivo.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021 
+
+startTimerA1:
+        mov     #CCIE, &TA1CCTL0
+        ret
+
+;Objetivo: Detener el timer.
+;Precondiciones: Que haya un timer corriendo
+;Postcondiciones: El timer se desactiva.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+stopTimerA1:
+        bic     #CCIE, &TA1CCTL0        ; Stop Timer
+        ret
+
+;Objetivo: Inicializar y configurar las especificaciones del timer para el corazon
+;Precondiciones: 
+;Postcondiciones: El timer esta configurado y listo para utilizarse.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021 
+
+setupTimerA1:
+        mov     #TASSEL_2+MC_1+ID_2, &TA1CTL  ;Set timer according to next table
+	nop
+        ; Uses SMCLK and up mode
+        ; TASSELx        MCx (mode control)                IDx (input divider)
+        ; 00 -> TACLK    00 -> Stop                        00 -> /1
+        ; 01 -> ACLK     01 -> Up mode (up to TACCR0)      01 -> /2
+        ; 10 -> SMCLK    10 -> Continuous (up to 0FFFFh)   02 -> /4
+        ; 11 -> INCLK    11 -> Up/down (top on TACCR0)     03 -> /8
+
+        ; period = cycles * divider / SMLCK
+        ; Assuming SMLCK = 1 MHz, divider = 8 and period = 0.2 seg
+        ; cycles = 62500.  With period = 0.5 LED turn on every 1 second
+        mov     #50000, &TA1CCR0        ; Set the timer capture compare register 0
+
+        ret
+
+;Objetivo: Borrar lo que aparece en pantalla (el display).
+;Precondiciones: Que haya algo escrito en pantalla.
+;Postcondiciones: Los caracteres en pantalla se borran.
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 3/14/2021 - 4/25/2021 
+
+clearDisplay: ; Clears the LCD display
+        mov     #2, &LCDCMEMCTL
+        ret 
+
+;Objetivo: Inicializar todas las variables principales en el RAM.
+;Precondiciones: 
+;Postcondiciones: Todas las variables estan disponibles para usarse
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+initState:
+        ;initializing all important variables to the Ram
+        mov.b   #0, state
+        mov.b   #0, readingPosition
+        mov.b   #0, displayposition
+        mov.b   #0, numberPointer
+        mov.b   #0, curDigit
+        mov.b   #0, BatteryBarPointer
+        mov.b   #0, BatterymemoryPointer
+        mov.b   #0, heart
+        mov.b   #0, BpmCounter
+        mov.b   #0, ticks
+        mov.b   #0,SecondsCounter
+        mov.b   #0,PeriodCounter
+        mov     #0,BPMResult
+        
+        call    #DisplayOption
+
+        ret
+
+;Objetivo: Llamar/activar las funciones (encender y apagar el corazon) correspondientes a ese timer.
+;Precondiciones: Que el timerA1 este disponible.
+;Postcondiciones: Las funciones correspondientes al timer se activan adecuadamente.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+TIMER_A1_ISR:
+        call    #TurnOffHeart
+        call    #stopTimerA1
+        reti
+
+;Objetivo: Llamar/activar las funciones (medir el tiempo entre periodos, y la funcion principal del BPM) correspondientes a ese timer.
+;Precondiciones: Que el timerA0 este disponible.
+;Postcondiciones: Las funciones correspondientes al timer se activan adecuadamente.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+TIMER_A0_ISR:        
+        inc.b  ticks
+         
+        call   #checkSeconds 
+        call   #checkPeriods
+        call   #checkfor30Seconds
+         
+        jmp    finTimer
+
+;Objetivo: Desactivar las funciones correspondientes a cada timer.
+;Precondiciones: Que haya un timer activado.
+;Postcondiciones: Las funciones correspondientes al timer se deactivan adecuadamente.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+finTimer:
+        reti
+
+;Objetivo: Verifica si han transcurrido 5 periodos de 6 segundos (30seg)
+;Precondiciones: Que el BPM counter este corriendo.
+;Postcondiciones: Se finaliza el conteo de periodos.
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021
+
+checkfor30Seconds:
+        cmp.b   #5, PeriodCounter ; Remember to change to 5
+        jnz     skip
+        mov.b   #0, PeriodCounter
+        call    #stopTimerA0
+        call    #clockDisplay
+        mov.b   #5, state
+        
+        ret
+
+;Objetivo: Encender el corazon.
+;Precondiciones: Que se haya presionado S1 mientras corre el BPM counter.
+;Postcondiciones: El corazon esta encendido.
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021
+
+TurnOnHeart:
+        mov.b   #00000100B, &0xA22
+        ret
+
+;Objetivo: Apagar el corazon.
+;Precondiciones: Que haya el corazon este encendido.
+;Postcondiciones: El corazon esta apagado.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+TurnOffHeart:
+        mov.b   #0, &0xA22
+        ret
+
+;Objetivo: LLevar conteo de los segundos.
+;Precondiciones: Que hayan pasado dos ticks (0.5seg).
+;Postcondiciones: Se registra el paso de 1 segundo.
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021
+
+checkSeconds:
+        cmp.b   #2, ticks
+        jnz     skip
+        
+        inc.b   SecondsCounter
+        mov.b   #0, ticks
+        call    #BatteryBarr
+
+;Objetivo: Ignorar, brincar la funcion/instruccion.
+;Precondiciones: N/A.
+;Postcondiciones: Se sale de la instruccion.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+skip:      
+        ret
+
+;Objetivo: LLevar conteo de los periodos.
+;Precondiciones: Que hayan pasado 6 segundos.
+;Postcondiciones: Se registra el paso de 1 periodo.
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021 
+
+checkPeriods:
+        cmp.b  #6, SecondsCounter
+        jnz    skip  
+         
+        inc.b  PeriodCounter
+        mov.b  #0, SecondsCounter
+        call   #displayBPMClear 
+        
+        cmp.b  #1, PeriodCounter ; Multiplier = 10
+        jeq    Period1
+        cmp.b  #2, PeriodCounter ; Multiplier = 5
+        jeq    Period2
+        cmp.b  #3, PeriodCounter ; Multiplier = 3.33
+        jeq    Period3
+        cmp.b  #4, PeriodCounter ; Multiplier = 2.5
+        jeq    Period4
+        cmp.b  #5, PeriodCounter ; Multiplier = 2
+        jeq    Period5
+        
+        ret
+
+;Objetivo: Estimar el BPM total basado en las pulsaciones registradas en el periodo 1.
+;Precondiciones: Que haya pasado el primer periodo.
+;Postcondiciones: Se estima el BPM total.
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021 
+
+Period1:
+        mov     #10, num1
+        mov     BpmCounter, R6
+        mov     R6, num2
+        
+        call    #multiply
+        
+        call    #DisplayBMP
+          
+        mov.b   #4, R7
+        mov.b   BPMResult, R9
+        
+        call    #displayNumberBPM
+        jmp     PeriodCleanUp
+
+;Objetivo: Estimar el BPM total basado en las pulsaciones registradas en el periodo 2.
+;Precondiciones: Que haya pasado el segundo periodo.
+;Postcondiciones: Se estima el BPM total.
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021 
+
+Period2:
+        mov     #5, num1
+        mov     BpmCounter, R6
+        mov     R6, num2
+        
+        call    #multiply
+        
+        call    #DisplayBMP
+          
+        mov.b   #4, R7
+        mov.b   BPMResult, R9
+        
+        call    #displayNumberBPM
+        jmp     PeriodCleanUp
+
+;Objetivo: Estimar el BPM total basado en las pulsaciones registradas en el periodo 3.
+;Precondiciones: Que haya pasado el tercer periodo.
+;Postcondiciones: Se estima el BPM total.
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021 
+
+Period3:
+        mov     #3, num1
+        mov     BpmCounter, R6
+        mov     R6, num2
+        mov     #3, num3
+        
+        call    #multiply
+        call    #divide
+        add     num3, BPMResult
+        
+        call    #DisplayBMP
+          
+        mov.b   #4, R7
+        mov.b   BPMResult, R9
+        
+        call    #displayNumberBPM
+        jmp     PeriodCleanUp        
+
+;Objetivo: Estimar el BPM total basado en las pulsaciones registradas en el periodo 4.
+;Precondiciones: Que haya pasado el cuarto periodo.
+;Postcondiciones: Se estima el BPM total.
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021 
+
+Period4:
+        mov     #2, num1
+        mov     BpmCounter, R6
+        mov     R6, num2
+        mov     #2, num3
+        
+        call    #multiply
+        call    #divide
+        add     num3, BPMResult
+        
+        call    #DisplayBMP
+          
+        mov.b   #4, R7
+        mov.b   BPMResult, R9
+        
+        call    #displayNumberBPM
+        jmp     PeriodCleanUp        
+
+;Objetivo: Estimar el BPM total basado en las pulsaciones registradas en el periodo 5.
+;Precondiciones: Que haya pasado el quinto periodo.
+;Postcondiciones: Se estima el BPM total.
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021 
+
+Period5:
+        mov     #2, num1
+        mov     BpmCounter, R6
+        mov     R6, num2
+        
+        call    #multiply
+        
+        call    #DisplayBMP
+          
+        mov.b   #4, R7
+        mov.b   BPMResult, R9
+        
+        call    #displayNumberBPM
+
+;Objetivo: Borrar la data del periodo corriente.
+;Precondiciones: Que haya pasado un periodo.
+;Postcondiciones: Se borra la data del periodo anterior.
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021 
+
+PeriodCleanUp: 
+        ret
+
+;Objetivo: Limpiar el interrupt flag.
+;Precondiciones: Que haya generado una interrupcion.
+;Postcondiciones: El interrupt flag esta vacio.
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021 
+
+fin:    
+        bic.b   #0xff, &P1IFG      ; Clear interrupt flag and check
+        reti
+
+;Objetivo: Configura los interrupts para los botones.
+;Precondiciones: Undir algun boton.
+;Postcondiciones: Detecta el boton que se undio y brinca al metodo correspondiente.
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021
+
+PORT1_ISR:
+        call    #delay ; delay
+
+        bit.b   #00000010b, &P1IFG     ; Test P1IFG to detect if there is
+                                        ; an interrupt generated by P1.1 
+                                        ; that corresponds to push button S1
+        jnz     S1StateCheck
+        
+        bit.b   #00000100b, &P1IFG    ; Test P1IFG to detect if there is
+                                        ; an interrupt generated by P1.2
+                                        ; that corresponds to push button S2
+        jnz     S2StateCheck
+                                           
+        bic.b   #0xff, &P1IFG      ; Clear interrupt flag and check 
+   
+	jmp     fin
+
+;Objetivo: Compara los estados para el boton S1.
+;Precondiciones: Undir el boton S1.
+;Postcondiciones: Brinca al estado correspondiente.
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021
+
+S1StateCheck:
+        mov.b   state, R5
+        
+        cmp.b   #0, R5  ;if state == 0 and right click
+        jeq     fin
+
+        cmp.b   #1, R5; if state ==1 (Read state) and left clock
+        jeq     BPMReadingState
+        
+        cmp.b   #2, R5  ;if state ==2 and left click
+        jeq     LastThreeReading
+        
+        cmp.b   #3, R5  ;if state ==3 and left click
+        jeq     LastThreeReading
+        
+        cmp.b   #4, R5;if state == 6(Reading BPM) and left click 
+        jeq     heartToggleBpmIncrease
+        
+        cmp.b   #6, R5
+        jeq     SaveLastEntry
+
+        jmp     fin
+
+;Objetivo: Compara los estados para el boton S2.
+;Precondiciones: Undir el boton S2.
+;Postcondiciones: Brinca al estado correspondiente.
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021
+
+S2StateCheck:
+        mov.b   state, R5
+        cmp.b   #0, R5
+        jeq     DisplayRead
+        
+        cmp.b   #1, R5
+        jeq     DisplayLog
+        
+        cmp.b   #2, R5
+        jeq     DisplayRead
+        
+        cmp.b   #5, R5
+        jeq     SaveState
+        
+        cmp.b   #6, R5
+        jeq     goToOption
+  
+        jmp     fin
+
+;Objetivo: Volver al estado inicial.
+;Precondiciones: N/A.
+;Postcondiciones: Se vuelve al estado inicial y se muestra "Opcion".
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021
+
+goToOption:
+        call    #initState
+        jmp     fin
+
+;Objetivo: Guardar la lectura que se tomo actualmente.
+;Precondiciones: Haber hecho una lectura y presionado el boton S1.
+;Postcondiciones: Se guarda la lectura mas reciente.
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021
+
+SaveLastEntry:
+        push    R5
+        push    R6
+        push    R7
+        push    R8
+        
+        mov     reading1, R5
+        mov     reading2, R6
+        mov     reading3, R7
+        mov     BPMResult,R8
+        
+        mov     R6, R7
+        mov     R5, R6
+        mov     R8, R5
+        
+        mov     R5, reading1
+        mov     R6, reading2
+        mov     R7, reading3
+         
+        pop     R8
+        pop     R7
+        pop     R6
+        pop     R5
+        
+        jmp     goToOption
+
+;Objetivo: Muestra "Save" en el LCD y da la opcion de guardar la lectura.
+;Precondiciones: Haber hecho una lectura y presionado el boton S2.
+;Postcondiciones: Se muestra "Save".
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021
+
+SaveState:
+        mov.b   #6, state
+        call    #DisplaySave
+        
+        jmp     fin
+
+;BPM
+/////////////////////////////////////////////////////////////////////////
+;Objetivo: Mostrar el segmento del corazon cada vez que se presiona el boton S1 durante el periodo de leer la lectura BPM.
+;Precondiciones: Estar en el estado 1, luego de "Read", y haber presionado S1.
+;Postcondiciones: Muestra el corazon.
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021
+
+heartToggleBpmIncrease:
+        call    #startTimerA1
+        call    #TurnOnHeart
+        inc.b   BpmCounter
+        jmp     fin
+
+;Objetivo: Encargarse del LCD cuando se va a leer una lectura nueva del BPM.
+;Precondiciones: Estar en el estado 1, luego de "Read".
+;Postcondiciones: Comienza a tomar la lectura del BPM.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+BPMReadingState:
+        call    #clearDisplay
+        mov.b   #4, state ; Move to BPM reading state
+        ;must start clock
+        mov.b   #0, BpmCounter
+        call    #BatteryBarr
+        call    #startTimerA0
+        jmp     fin
+
+;Objetivo: Inicia el proceso de mostrar los segmentos de la bateria.
+;Precondiciones: N/A.
+;Postcondiciones: Muestra los segmentos de la bateria creciente.
+;Autor: Kevin Lugo, José Maldonado, Ramphis López
+;Fecha: 4/19/2021 - 4/25/2021
+
+BatteryBarr:
+        cmp.b   #7, BatteryBarPointer
+        jeq     resetBattery
+          
+        cmp.b   #0, BatteryBarPointer
+        jeq     displayOutline
+          
+        cmp.b   #1, BatteryBarPointer
+        jeq     displayfirstSegment
+          
+        cmp.b   #2, BatteryBarPointer
+        jeq     displaySecondSegment
+          
+        cmp.b   #3, BatteryBarPointer
+        jeq     displayThirdSegment
+          
+        cmp.b   #4, BatteryBarPointer
+        jeq     displayFourthSegment
+          
+        cmp.b   #5, BatteryBarPointer
+        jeq     displayFifthSegment
+          
+        cmp.b   #6, BatteryBarPointer
+        jeq     displaySixthSegment
+
+        ret
+
+;Objetivo: Reinicia el proceso de mostrar los segmentos de la bateria.
+;Precondiciones: N/A.
+;Postcondiciones: Vuelve al primer segmento de la bateria.
+;Autor: Kevin Lugo, José Maldonado, Ramphis López
+;Fecha: 4/19/2021 - 4/25/2021
+
+resetBattery:
+        mov.b   #1, BatteryBarPointer
+        jmp     displayfirstSegment       
+
+;Objetivo: Mostrar el segmento alrededor de la bateria.
+;Precondiciones: N/A.
+;Postcondiciones: Muestra el segmento alrededor de la bateria.
+;Autor: Kevin Lugo, José Maldonado, Ramphis López
+;Fecha: 4/19/2021 - 4/25/2021
+
+displayOutline:
+        mov.b   #00010000B,&0X0a31  
+        mov.b   #0,&0X0a2d 
+      
+        jmp     finBattery
+
+;Objetivo: Mostrar el segmento uno de la bateria.
+;Precondiciones: N/A.
+;Postcondiciones: Muestra el segmento uno.
+;Autor: Kevin Lugo, José Maldonado, Ramphis López
+;Fecha: 4/19/2021 - 4/25/2021
+
+displayfirstSegment:
+        mov.b   #00110000B,&0X0a31 
+        mov.b   #0,&0X0a2d 
+      
+        jmp     finBattery
+
+;Objetivo: Mostrar el segmento dos de la bateria.
+;Precondiciones: N/A.
+;Postcondiciones: Muestra el segmento dos.
+;Autor: Kevin Lugo, José Maldonado, Ramphis López
+;Fecha: 4/19/2021 - 4/25/2021
+
+displaySecondSegment:
+        mov.b   #00110000B,&0X0a31
+        mov.b   #00100000B, &0X0a2d 
+      
+        jmp     finBattery
+
+;Objetivo: Mostrar el segmento tres de la bateria.
+;Precondiciones: N/A.
+;Postcondiciones: Muestra el segmento tres.
+;Autor: Kevin Lugo, José Maldonado, Ramphis López
+;Fecha: 4/19/2021 - 4/25/2021
+
+displayThirdSegment:  
+        mov.b   #01110000B, &0X0a31 
+        mov.b   #00100000B, &0X0a2d 
+        jmp     finBattery  
+
+;Objetivo: Mostrar el segmento cuatro de la bateria.
+;Precondiciones: N/A.
+;Postcondiciones: Muestra el segmento cuatro.
+;Autor: Kevin Lugo, José Maldonado, Ramphis López
+;Fecha: 4/19/2021 - 4/25/2021
+
+displayFourthSegment: 
+        mov.b   #01110000B, &0X0a31
+        mov.b   #01100000B, &0X0a2d  
+        jmp     finBattery
+
+;Objetivo: Mostrar el segmento cinco de la bateria.
+;Precondiciones: N/A.
+;Postcondiciones: Muestra el segmento cinco.
+;Autor: Kevin Lugo, José Maldonado, Ramphis López
+;Fecha: 4/19/2021 - 4/25/2021
+
+displayFifthSegment:
+        mov.b   #11110000B, &0X0a31
+        mov.b   #01100000B, &0X0a2d 
+        jmp     finBattery
+
+;Objetivo: Mostrar el segmento seis de la bateria.
+;Precondiciones: N/A.
+;Postcondiciones: Muestra el segmento seis.
+;Autor: Kevin Lugo, José Maldonado, Ramphis López
+;Fecha: 4/19/2021 - 4/25/2021
+
+displaySixthSegment:
+        mov.b   #11110000B, &0X0a31
+        BIS.B   #11100000B, &0X0a2d 
+        jmp     finBattery
+
+;Objetivo: Culmina el proceso de mostrar los segmentos de la bateria.
+;Precondiciones: Haber terminado el proceso.
+;Postcondiciones: N/A.
+;Autor: Kevin Lugo, José Maldonado, Ramphis López
+;Fecha: 4/19/2021 - 4/25/2021
+
+finBattery:
+        inc.b   BatteryBarPointer
+        ret
+
+;The Following Subroutings will allow the MSP430 to display the 3 most recent readings
+/////////////////////////////////////////////////////////////////////////////
+;Objetivo: Comparar el estado actual para moverse a las lecturas.
+;Precondiciones: N/A.
+;Postcondiciones: Si resulta cierto, muestra las tres lecturas mas recientes.
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021
+
+readingsStateCheck:
+        cmp.b   #2, R5
+        jeq     incrementState
+        ret  
+
+;Objetivo: Incrementa el estado.
+;Precondiciones: N/A.
+;Postcondiciones: Se incrementa el estado por 1.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+incrementState:
+        inc.b   state
+        ret
+        
+;Objetivo: Mostrar las tres lecturas mas recientes guardadas por el usuario.
+;Precondiciones: Estar en estado 2, luego de "Log".
+;Postcondiciones: Termina de mostrar lecturas.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+LastThreeReading:
+        call    #readingsStateCheck; if state is 2 it will change it to 3
+                                ;otherwise it wont do anything
+        cmp.b   #3, readingPosition
+        jeq     finishReading
+        
+        call    #displayBPMClear
+        cmp.b   #0, readingPosition
+        jeq     displayReading1; this will display the most recent reading
+        cmp.b   #1, readingPosition
+        jeq     displayReading2; this will display the second most recent reading
+        cmp.b   #2, readingPosition
+        jeq     displayReading3; this will display the third most recent reading
+
+;Objetivo: Termina el proceso de mostrar lecturas.
+;Precondiciones: N/A.
+;Postcondiciones: Termina de mostrar lecturas.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+finishReading:
+        mov.b   #0, readingPosition
+        call    #initState
+        mov.b   #0, numberPointer
+        jmp     fin
+
+;Objetivo: Mostrar la primera lectura mas reciente.
+;Precondiciones: Estar en estado 2, luego de "Log".
+;Postcondiciones: Muestra la lectura.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+displayReading1:
+        push    R7
+        push    R9
+          
+        mov.b   #1, readingPosition      
+        call    #clearDisplay
+        call    #DisplayBMP
+          
+        mov.b   #4, R7 ;contains the position of the lcd
+        mov.b   reading1, R9 ; number to display
+          
+        call    #displayNumberBPM
+        jmp     readingEnd
+
+;Objetivo: Mostrar la segunda lectura mas reciente.
+;Precondiciones: Estar en estado 2, luego de "Log".
+;Postcondiciones: Muestra la lectura.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+displayReading2:
+        push    R7
+        push    R9
+        mov.b   #2, readingPosition      
+        call    #clearDisplay
+        call    #DisplayBMP
+          
+        mov.b   #4, R7
+        mov.b   reading2, R9
+          
+        call    #displayNumberBPM
+        jmp     readingEnd
+
+;Objetivo: Mostrar la tercera lectura mas reciente.
+;Precondiciones: Estar en estado 2, luego de "Log".
+;Postcondiciones: Muestra la lectura.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+displayReading3:
+        push    R7
+        push    R9
+          
+        mov.b   #3, readingPosition      
+        call    #clearDisplay
+        call    #DisplayBMP
+          
+        mov.b   #4, R7
+        mov.b   reading3, R9
+          
+        call    #displayNumberBPM 
+        jmp     readingEnd
+
+;Objetivo: Termina el proceso de mostrar lecturas.
+;Precondiciones: N/A.
+;Postcondiciones: Termina de mostrar lecturas.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+readingEnd:   
+        pop     R9
+        pop     R7
+        jmp     fin
+
+///////////////////////////////////////////////////////////////////////////////
+
+;The following code will allow the MSP430 to dynamically display numbers to the LCD screen
+///////////////////////////////////////////////////////////////////////////////
+;Objetivo: Presentar un resultado normal en la pantalla
+;Precondiciones: Tener un resultado para presentar.
+;Postcondiciones: El resultado se devuelve.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 4/25/2021
+
+;-------passed values-------
+;R7 -> lcd position
+;R9 -> Number to display
+displayNumberBPM: 
+        ; passed in R9 , R10 = Mod Result, R11 == result of Division
+        call    #modDiv 
+        mov     R11, R9 ; X = X/10
+        
+        mov.b   R10, curDigit ; currDigit = X % 10
+        mov.b   R7, displayposition
+        call    #genNumber
+        
+        decd.b  R7  
+        
+        
+        cmp.b   #0, R9  ;if number is 0
+        jeq     endLoop
+        jmp     displayNumberBPM
+
+;Objetivo: Encontrar el modulo (remainder) de una división.
+;Precondiciones: Tener un resultado para presentar.
+;Postcondiciones: El resultado se devuelve.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 4/25/2021
+
+modDiv: ; Divides both numbers 
+        mov     R9, R10 ; assign remainder to R10
+        mov     #0, R11
+
+        ; R10 --> numerador
+        cmp     #0, R10
+        jz      modDivResult
+        cmp     #10, R10          ; num1 - num2
+        jn      modDivResult
+
+;Objetivo: Ayudar a encontrar el modulo (remainder) de una división.
+;Precondiciones: Tener un resultado para presentar.
+;Postcondiciones: El resultado se devuelve.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 4/25/2021
+
+modDivHelper: ; Divide helper method, keeps subtracting
+        sub     #10, R10          ; num1 <- num1 - num2
+        inc     R11               ; increase remainder value
+        cmp     #10, R10
+        jge     modDivHelper
+
+;Objetivo: Devolver el resultado de división.
+;Precondiciones: Tener un resultado para presentar.
+;Postcondiciones: El resultado se devuelve.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 4/25/2021
+
+modDivResult: ; Return the division result
+        ret
+
+;Objetivo: Limpiar el LCD de numeros existentes.
+;Precondiciones: N/A.
+;Postcondiciones: Apaga los segmentos de numeros prendidos.
+;Autor: Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021
+
+displayBPMClear: 
+        mov.b #0, &0xA29
+        mov.b #0, &0xA2A
+        mov.b #0, &0xA25
+        mov.b #0, &0xA26
+        mov.b #0, &0xA23
+        mov.b #0, &0xA24
+        ret
+
+;Objetivo: Generar el digito en el LCD display.
+;Precondiciones: N/A.
+;Postcondiciones: Genera el digito en el LCD display.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 4/25/2021
+
+genNumber: ; Assigns number and position to display 
+        push    R5
+        push    R6
+        CALL    #displayNumber
+        
+        pop     R6
+        pop     R5
+        ret
+
+;Objetivo: Muestra el digito en el LCD display.
+;Precondiciones: N/A.
+;Postcondiciones: Muestra el digito en el LCD display.
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 4/25/2021
+
+displayNumber:
+        push.b  R5
+        push.b  R6
+        push.b  R7
+        
+        mov.b   displayposition, R5
+        mov.b   curDigit, R7 ;selection the position in the LCD
+        mov     positionHighBytes(R5), R6 ; make r6 a pointer         
+        mov.b   numberHighBytes(R7), 0(R6) ; access value in memory R6 position is always 0        
+        mov     positionLowBytes(R5), R6 ; repeat with the lowBytes        
+        mov.b   numberLowBytes(R7), 0(R6)
+        
+        pop.b   R7
+        pop.b   R6
+        pop.b   R5        
+        ret
+endLoop:
+        ret
+
+//////////////////////////////////////////////////////////////////////////////
+;All Drawings methods will be here  
+
+;Objetivo: Hacer display en el LCD la palabra "Option".
+;Precondiciones: Estar en estado 0.
+;Postcondiciones: Muestra la palabra "Option" en el LCD.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+DisplayOption:
+        push    R6
+        push    R7
+        
+        mov.b   #0, R6
+        ;Printing Letter O in position 0
+        mov     positionHighBytes(R6), R7
+        mov.b   #0xFC, 0(R7)
+        mov     positionLowBytes(R6), R7
+        mov.b   #0, 0(R7)
+        incd.b  R6
+        ;Printing Letter P in position 1
+        mov     positionHighBytes(R6), R7
+        mov.b   #0xCF, 0(R7)
+        mov     positionLowBytes(R6), R7
+        mov.b   #0, 0(R7)
+        incd.b  R6
+        
+        ;Printing Letter T in position 2
+        mov     positionHighBytes(R6), R7
+        mov.b   #0x80, 0(R7)
+        mov     positionLowBytes(R6), R7
+        mov.b   #0x50, 0(R7)
+        incd.b  R6
+        ;Printing Letter I in position 3
+        mov     positionHighBytes(R6), R7
+        mov.b   #0x90, 0(R7)
+        mov     positionLowBytes(R6), R7
+        mov.b   #0x50, 0(R7)
+        incd.b  R6
+        ;Printing Letter O in position 4
+        mov     positionHighBytes(R6), R7
+        mov.b   #0xFC, 0(R7)
+        mov     positionLowBytes(R6), R7
+        mov.b   #0, 0(R7)
+        incd.b  R6
+        ;Printing Letter N in position 5
+        mov     positionHighBytes(R6), R7
+        mov.b   #0x6C, 0(R7)
+        mov     positionLowBytes(R6), R7
+        mov.b   #0x82, 0(R7)
+        
+        pop     R7
+        pop     R6
+        ret  
+
+;Objetivo: Hacer display en el LCD la palabra "Read".
+;Precondiciones: Estar en el estado 1.
+;Postcondiciones: Muestra la palabra "Read" en el LCD.
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+DisplayRead:
+        push    R6
+        push    R7
+        
+        call    #clearDisplay
+        
+        mov.b   #1, state
+        
+        mov.b   #0, R6
+        ;Printing Letter R in position 0
+        mov     positionHighBytes(R6), R7
+        mov.b   #0xCF, 0(R7)
+        mov     positionLowBytes(R6), R7
+        mov.b   #0x02, 0(R7)
+        incd.b  R6
+        ;Printing Letter E in position 1
+        mov     positionHighBytes(R6), R7
+        mov.b   #0x9F, 0(R7)
+        mov     positionLowBytes(R6), R7
+        mov.b   #0, 0(R7)
+        incd.b  R6
+        
+        ;Printing Letter A in position 2
+        mov     positionHighBytes(R6), R7
+        mov.b   #0xEF, 0(R7)
+        mov     positionLowBytes(R6), R7
+        mov.b   #0, 0(R7)
+        incd.b  R6
+        ;Printing Letter D in position 3
+        mov     positionHighBytes(R6), R7
+        mov.b   #0xF0, 0(R7)
+        mov     positionLowBytes(R6), R7
+        mov.b   #0x50, 0(R7)
+        incd.b  R6
+        
+        pop     R7
+        pop     R6
+        jmp     fin
+
+;Objetivo: Hacer display en el LCD la palabra "Log".
+;Precondiciones: Estar en estado 1.
+;Postcondiciones: Muestra la palabra "Log".
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+DisplayLog:
+        push    R6
+        push    R7
+        
+        call    #clearDisplay
+        
+        mov.b   #2, state
+        
+        mov.b   #0, R6
+        ;Printing Letter L in position 0
+        mov     positionHighBytes(R6), R7
+        mov.b   #0x1C, 0(R7)
+        mov     positionLowBytes(R6), R7
+        mov.b   #0, 0(R7)
+        incd.b  R6
+        ;Printing Letter O in position 1
+        mov     positionHighBytes(R6), R7
+        mov.b   #0xFC, 0(R7)
+        mov     positionLowBytes(R6), R7
+        mov.b   #0, 0(R7)
+        incd.b  R6
+        
+        ;Printing Letter G in position 2
+        mov     positionHighBytes(R6), R7
+        mov.b   #0xBD, 0(R7)
+        mov     positionLowBytes(R6), R7
+        mov.b   #0, 0(R7)
+        incd.b  R6
+        
+        pop     R7
+        pop     R6
+        jmp     fin 
+
+;Objetivo: Hacer display en el LCD la palabra "BPM".
+;Precondiciones: Estar tomando un BPM nuevo o viendo los BPM guardados.
+;Postcondiciones: Muestra la palabra "BPM".
+;Autor: Kevin Lugo
+;Fecha: 4/19/2021 - 4/25/2021
+
+DisplayBMP:
+        push    R6
+        push    R7
+        
+        mov.b   #6, R6
+        ;Printing Letter B in position 3
+        mov     positionHighBytes(R6), R7
+        mov.b   #0xF1, 0(R7)
+        mov     positionLowBytes(R6), R7
+        mov.b   #0x50, 0(R7)
+        incd.b  R6
+        ;Printing Letter P in position 4
+        mov     positionHighBytes(R6), R7
+        mov.b   #0xCF, 0(R7)
+        mov     positionLowBytes(R6), R7
+        mov.b   #0, 0(R7)
+        incd.b  R6
+        
+        ;Printing Letter M in position 5
+        mov     positionHighBytes(R6), R7
+        mov.b   #0x6C, 0(R7)
+        mov     positionLowBytes(R6), R7
+        mov.b   #0xA0, 0(R7)
+        incd.b  R6
+        
+        pop     R7
+        pop     R6
+        ret
+       
+;Objetivo: Hacer display en el LCD el simbolo del reloj.
+;Precondiciones: Terminar de leer el BPM actual (estado 5).
+;Postcondiciones: Muestra el reloj en el LCD.
+;Autor: Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021 
+      
+clockDisplay:
+        mov.b   #8, &0xA22
+        ret
+
+;Objetivo: Hacer display en el LCD la palabra "Save".
+;Precondiciones: Estar en estado 6.
+;Postcondiciones: Se muestra la palabra "Save".
+;Autor: Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021
+       
+DisplaySave:
+        push    R6
+        push    R7
+
+        call    #clearDisplay
+
+        mov.b   #0, R6
+        ;Printing Letter S in position 0
+        mov     positionHighBytes(R6), R7
+        mov.b   #0xB7, 0(R7)
+        mov     positionLowBytes(R6), R7
+        mov.b   #0, 0(R7)
+        incd.b  R6
+        ;Printing Letter A in position 1
+        mov     positionHighBytes(R6), R7
+        mov.b   #0xEF, 0(R7)
+        mov     positionLowBytes(R6), R7
+        mov.b   #0, 0(R7)
+        incd.b  R6
+
+        ;Printing Letter V in position 2
+        mov     positionHighBytes(R6), R7
+        mov.b   #0xC, 0(R7)
+        mov     positionLowBytes(R6), R7
+        mov.b   #0x28, 0(R7)
+        incd.b  R6
+
+        ;Printing Letter E in position 3
+        mov     positionHighBytes(R6), R7
+        mov.b   #0x9F, 0(R7)
+        mov     positionLowBytes(R6), R7
+        mov.b   #0, 0(R7)
+        incd.b  R6
+
+        pop     R7
+        pop     R6
+        ret        
+
+///////////////////////////////////////////////////////////////////////////////
+
+;Objetivo: Multiplica dos numeros.
+;Precondiciones: Tener dos numeros.
+;Postcondiciones: Retorna la multiplicacion de dos numeros en la variable "BPMResult".
+;Autor: Yavier Mari, Jose Maldonado
+;Fecha: 3/14/2021 - 3/17/2021
+
+multiply: ; Multiplies both numbers
+        push    R5 ; counter
+        push    R6 ; result value
+        push    R7 ; smaller number
+        push    R8 ; bigger number
+
+        mov     #0, R5
+        mov     #0, R6
+        mov     num2, R8
+        mov     num1, R7
+        
+        cmp     #0, R7
+        jz      multiplyResult
+        cmp     #0, R8
+        jz      multiplyResult
+        cmp     R8, R7 ; num1 - num2, positive means num1 is bigger, negative means num2 is bigger
+        jz      num1Smaller ; same number, multiply normally
+        jn      num1Smaller ; R7 (num1) is smaller, multiply normally
+
+;Objetivo: Intercambia los numeros en los registros para una multiplicacion mas eficiente.
+;Precondiciones: Tener dos numeros, el operando * y que el segundo numero sea menos que el primero.
+;Postcondiciones: Intercambia los numeros de los registros.
+;Autor: Yavier Mari, Jose Maldonado
+;Fecha: 3/14/2021 - 3/17/2021
+
+num2Smaller: ; Swap numbers so that smaller is on R7
+        mov     num1, R8
+        mov     num2, R7
+
+;Objetivo: Compara el contador y el numero menos para saber si termino la multiplicacion.
+;Precondiciones: Tener dos numeros y querer seguir multiplicando.
+;Postcondiciones: El numero se termino de multiplicar.
+;Autor: Yavier Mari, Jose Maldonado
+;Fecha: 3/14/2021 - 3/17/2021
+
+num1Smaller: ; Continue multiplying
+        cmp     R5, R7  ; if this aint equal
+        jz      multiplyResult
+
+;Objetivo: Continua sumando hasta llegar a la multiplicacion deseada.
+;Precondiciones: Tener dos numeros y querer seguir multiplicando.
+;Postcondiciones: El numero se le sumo otra vez para continuar la multiplicacion.
+;Autor: Yavier Mari, Jose Maldonado
+;Fecha: 3/14/2021 - 3/17/2021
+
+multiplyHelper: ; Keeps adding to the result until mult. is done
+        inc     R5      ; increment counter
+        add     R8, R6  ; keep adding
+        cmp     R5, R7
+        jne     multiplyHelper
+
+;Objetivo: Devuelve el resultado de la multiplicacion.
+;Precondiciones: Terminar la multiplicacion.
+;Postcondiciones: El resultado se guarda en la variable "BPMResult".
+;Autor: Yavier Mari, Kevin Lugo
+;Fecha: 3/14/2021 - 3/17/2021
+
+multiplyResult: ; Returns the multiplication result
+        mov     R6, BPMResult
+
+        pop     R8
+        pop     R7
+        pop     R6
+        pop     R5
+
+        ret
+
+;Objetivo: Dividir dos numeros.
+;Precondiciones: Tener dos numeros.
+;Postcondiciones: Retorna la division de dos numeros. Nota Aclaratoria: En caso de division entre 0 (no es posible), se retornara 0.
+;Autor: Yavier Mari
+;Fecha: 3/14/2021 - 4/25/2021
+
+divide: ; Divides both numbers        
+        push    R5 ; quotient
+        push    R6 ; remainder
+        push    R7 ; result value
+
+        mov     num3, R5
+        mov     num2, R6
+        mov     #0, R7
+
+        cmp     #0, R5
+        jz      divideResult
+        cmp     #0, R6
+        jz      divideResult
+        cmp     R5, R6 ; num2 - num3
+        jn      divideResult
+
+;Objetivo: Restar los dos numeros hasta el resultado final.
+;Precondiciones: Tener dos numeros y querer seguir dividiendo.
+;Postcondiciones: El resultado es obtenido.
+;Autor: Yavier Mari
+;Fecha: 3/14/2021 - 3/17/2021
+
+divideHelper: ; Divide helper method, keeps subtracting
+        sub     R5, R6 ; num2 <- num2 - num3
+        inc     R7 ; increase result value
+        cmp     R5, R6
+        jge     divideHelper
+
+;Objetivo: Devolver el resultado de la division.
+;Precondiciones: Haber dividido dos numeros y tener el resultado.
+;Postcondiciones: El resultado es devuelto en la variable "num3".
+;Autor: Yavier Mari
+;Fecha: 3/14/2021 - 4/25/2021
+
+divideResult: ; Return the division result
+        mov     R7, num3
+        
+        pop     R7
+        pop     R6
+        pop     R5
+
+        ret
+
+;Objetivo: Crear un Delay en los inputs para evadir "bouncing".
+;Precondiciones: Tocar un boton.
+;Postcondiciones: Ocurre un Delay.
+;Autor: Kevin Lugo, Yavier Mari
+;Fecha: 4/19/2021 - 4/25/2021
+//////////////////////////////////////////////////////////////////////////////
+delay: ; Delays the input detection
+        mov     #0xFFFF, R15
+
+decDelay: ; Decreases the delay variable
+        dec     R15
+        jnz     decDelay
+        ret
+        
+        
+        END
